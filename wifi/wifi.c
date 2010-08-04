@@ -39,6 +39,7 @@ static struct wpa_ctrl *monitor_conn;
 extern int do_dhcp();
 extern int ifc_init();
 extern void ifc_close();
+extern int ifc_up(const char *name);
 extern char *dhcp_lasterror();
 extern void get_dhcp_info();
 extern int init_module(void *, unsigned long, const char *);
@@ -77,11 +78,113 @@ static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf"
 static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char MODULE_FILE[]         = "/proc/modules";
 
+/* rfkill support borrowed from bluetooth */
+static int rfkill_id = -1;
+static char *rfkill_state_path = NULL;
+
+
+static int init_rfkill() {
+    char path[64];
+    char buf[16];
+    int fd;
+    int sz;
+    int id;
+    for (id = 0; ; id++) {
+        snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%d/type", id);
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            LOGW("open(%s) failed: %s (%d)\n", path, strerror(errno), errno);
+            return -1;
+        }
+        sz = read(fd, &buf, sizeof(buf));
+        close(fd);
+        if (sz >= 4 && memcmp(buf, "wlan", 4) == 0) {
+            rfkill_id = id;
+            break;
+        }
+    }
+
+    asprintf(&rfkill_state_path, "/sys/class/rfkill/rfkill%d/state", rfkill_id);
+    return 0;
+}
+
+static int check_wifi_power() {
+    int sz;
+    int fd = -1;
+    int ret = -1;
+    char buffer;
+
+    if (rfkill_id == -1) {
+        if (init_rfkill()) goto out;
+    }
+
+    fd = open(rfkill_state_path, O_RDONLY);
+    if (fd < 0) {
+        LOGE("open(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
+             errno);
+        goto out;
+    }
+    sz = read(fd, &buffer, 1);
+    if (sz != 1) {
+        LOGE("read(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
+             errno);
+        goto out;
+    }
+
+    switch (buffer) {
+    case '1':
+        ret = 1;
+        break;
+    case '0':
+        ret = 0;
+        break;
+    }
+
+out:
+    if (fd >= 0) close(fd);
+    return ret;
+}
+
+static int set_wifi_power(int on) {
+    int sz;
+    int fd = -1;
+    int ret = -1;
+    const char buffer = (on ? '1' : '0');
+
+    if (rfkill_id == -1) {
+        if (init_rfkill()) goto out;
+    }
+
+    fd = open(rfkill_state_path, O_WRONLY);
+    if (fd < 0) {
+        LOGE("open(%s) for write failed: %s (%d)", rfkill_state_path,
+             strerror(errno), errno);
+        goto out;
+    }
+    sz = write(fd, &buffer, 1);
+    if (sz < 0) {
+        LOGE("write(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
+             errno);
+        goto out;
+    }
+    ret = 0;
+
+out:
+    if (fd >= 0) close(fd);
+    return ret;
+}
+
+/* end rfkill support */
+
 static int insmod(const char *filename, const char *args)
 {
     void *module;
     unsigned int size;
     int ret;
+
+	/* The ONE has the Wifi driver built into the kernel, no
+ 	 * module... use rfkill */
+	return set_wifi_power(1);
 
     module = load_file(filename, &size);
     if (!module)
@@ -98,6 +201,10 @@ static int rmmod(const char *modname)
 {
     int ret = -1;
     int maxtry = 10;
+
+	/* The ONE has the Wifi driver built into the kernel, no
+ 	 * module... use rfkill */
+	return set_wifi_power(0);
 
     while (maxtry-- > 0) {
         ret = delete_module(modname, O_NONBLOCK | O_EXCL);
@@ -136,6 +243,11 @@ const char *get_dhcp_error_string() {
 }
 
 static int check_driver_loaded() {
+	/* The ONE has the Wifi driver built into the kernel, no
+ 	 * module... use rfkill instead */
+
+    return check_wifi_power();
+
     char driver_status[PROPERTY_VALUE_MAX];
     FILE *proc;
     char line[sizeof(DRIVER_MODULE_TAG)+10];
@@ -306,8 +418,14 @@ int wifi_start_supplicant()
         serial = pi->serial;
     }
 #endif
+    /* The ar6k driver needs the interface up in order to scan! */
+    ifc_init();
+    ifc_up("wlan0");
+    sleep(1);
+
     property_set("ctl.start", SUPPLICANT_NAME);
     sched_yield();
+    usleep(2000000);
 
     while (count-- > 0) {
 #ifdef HAVE_LIBC_SYSTEM_PROPERTIES
